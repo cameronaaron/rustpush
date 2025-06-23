@@ -152,4 +152,9 @@ pub enum PushError {
     CircleHTTPError(#[from] icloud_auth::Error),
     #[error("Circle error {0}")]
     IdmsCircleError(i32),
+    #[error("Cryptography error: {0}")]
+    CryptoError(String),
+    #[error("Channel not found: {0}")]
+    ChannelNotFound(String),
 }
+
