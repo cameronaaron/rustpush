@@ -20,7 +20,16 @@ use crate::{aps::{get_message, APSChannel, APSChannelIdentifier, APSInterestToke
 use crate::util::{ec_serialize, ec_serialize_priv, bin_serialize, bin_deserialize, proto_serialize, proto_deserialize, ec_deserialize_priv_compact, ec_deserialize_compact, proto_serialize_vec, proto_deserialize_vec};
 use aes_gcm::KeyInit;
 
+// Safety constants
+const MAX_CHANNELS: usize = 50; // Prevent memory exhaustion
+const MAX_RATCHET_STEPS: u64 = 1000; // Prevent infinite loops
+const MIN_MESSAGE_SIZE: usize = 12; // Minimum size for nonce
+const SIGNATURE_SIZE: usize = 64; // Expected signature size
+const EC_KEY_SIZE: usize = 33; // Expected EC key size
+const CHANNEL_CACHE_DURATION_MS: u64 = 60 * 60 * 24 * 1000; // 24 hours
+
 pub mod statuskitp {
+    // Generate protobuf code at compile time
     include!(concat!(env!("OUT_DIR"), "/statuskitp.rs"));
 }
 
@@ -63,34 +72,50 @@ pub struct StatusKitSharedDevice {
 }
 
 impl SharedKey {
-    fn ratchet(&self) -> Self {
-        let hk = Hkdf::<Sha256>::from_prk(&self.key).expect("Failed to hkdf statuskit");
+    fn ratchet(&self) -> Result<Self, PushError> {
+        let hk = Hkdf::<Sha256>::from_prk(&self.key)
+            .map_err(|_| PushError::CryptoError("Failed to create HKDF from PRK".to_string()))?;
         let mut key = [0u8; 32];
-        hk.expand("com.apple.statuskit".as_bytes(), &mut key).expect("Failed to expand key!");
-        Self {
+        hk.expand("com.apple.statuskit".as_bytes(), &mut key)
+            .map_err(|_| PushError::CryptoError("Failed to expand HKDF key".to_string()))?;
+        Ok(Self {
             key: key.to_vec(),
             ratchet: self.ratchet + 1
-        }
+        })
     }
 
-    fn message_key(&self) -> [u8; 32] {
-        let hk = Hkdf::<Sha256>::from_prk(&self.key).expect("Failed to hkdf statuskit");
+    fn message_key(&self) -> Result<[u8; 32], PushError> {
+        let hk = Hkdf::<Sha256>::from_prk(&self.key)
+            .map_err(|_| PushError::CryptoError("Failed to create HKDF from PRK".to_string()))?;
         let mut key = [0u8; 32];
-        hk.expand("com.apple.statuskit-MessageKeys".as_bytes(), &mut key).expect("Failed to expand key!");
-        key
+        hk.expand("com.apple.statuskit-MessageKeys".as_bytes(), &mut key)
+            .map_err(|_| PushError::CryptoError("Failed to expand HKDF key".to_string()))?;
+        Ok(key)
     }
 }
 
 impl StatusKitSharedDevice {
     fn get_key(&mut self, index: u64) -> Result<SharedKey, PushError> {
-        let mut key = self.keys.iter().filter(|k| k.ratchet <= index).max_by_key(|k| k.ratchet).ok_or(PushError::RatchetKeyMissing(index))?.clone();
+        let mut key = self.keys.iter()
+            .filter(|k| k.ratchet <= index)
+            .max_by_key(|k| k.ratchet)
+            .ok_or(PushError::RatchetKeyMissing(index))?
+            .clone();
 
+        let mut steps = 0;
         while key.ratchet < index {
-            key = key.ratchet()
+            if steps >= MAX_RATCHET_STEPS {
+                return Err(PushError::CryptoError(format!("Too many ratchet steps: {}", steps)));
+            }
+            key = key.ratchet()?;
+            steps += 1;
         }
 
-        self.keys.clear(); // no one uses the old key anymore, right?
-        self.keys.push(key.clone());
+        // Only clear old keys and update if ratcheting was successful
+        self.keys.retain(|k| k.ratchet >= key.ratchet);
+        if !self.keys.iter().any(|k| k.ratchet == key.ratchet) {
+            self.keys.push(key.clone());
+        }
 
         Ok(key)
     }
@@ -114,16 +139,16 @@ pub struct StatusKitState {
 }
 
 impl StatusKitState {
-    fn build_aps_message_for(&self, channel: &APSChannelIdentifier, join: bool) -> APSChannel {
-        let Some(recent) = self.recent_channels.iter().find(|c| &c.identifier == channel) else {
-            panic!("No saved channel for identifier!")
-        };
+    fn build_aps_message_for(&self, channel: &APSChannelIdentifier, join: bool) -> Result<APSChannel, PushError> {
+        let recent = self.recent_channels.iter()
+            .find(|c| &c.identifier == channel)
+            .ok_or_else(|| PushError::ChannelNotFound(format!("No saved channel for identifier: {:?}", channel)))?;
 
-        APSChannel {
+        Ok(APSChannel {
             identifier: channel.clone(),
             last_msg_ns: recent.last_msg_ns,
             subscribe: join
-        }
+        })
     }
 }
 
@@ -338,9 +363,23 @@ pub struct StatusKitClient<T: AnisetteProvider> {
 }
 
 impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
-    pub async fn new(state: StatusKitState, update_state: Box<dyn Fn(&StatusKitState) + Send + Sync>, account: Arc<Mutex<AppleAccount<T>>>, conn: APSConnection, config: Arc<dyn OSConfig>, identity: IdentityManager) -> Arc<Self> {
+    pub async fn new(
+        state: StatusKitState, 
+        update_state: Box<dyn Fn(&StatusKitState) + Send + Sync>, 
+        account: Arc<Mutex<AppleAccount<T>>>, 
+        conn: APSConnection, 
+        config: Arc<dyn OSConfig>, 
+        identity: IdentityManager
+    ) -> Result<Arc<Self>, PushError> {
+        let interest_result = conn.request_topics(vec![
+            "com.apple.private.alloy.status.keysharing", 
+            "com.apple.icloud.presence.mode.status", 
+            "com.apple.icloud.presence.channel.management", 
+            "com.apple.private.alloy.status.personal"
+        ]).await;
+        
         let skclient = Arc::new(Self {
-            _interest_token: conn.request_topics(vec!["com.apple.private.alloy.status.keysharing", "com.apple.icloud.presence.mode.status", "com.apple.icloud.presence.channel.management", "com.apple.private.alloy.status.personal"]).await.0,
+            _interest_token: interest_result.0,
             conn: conn.clone(),
             identity,
             config,
@@ -368,7 +407,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
             }
         });
 
-        skclient
+        Ok(skclient)
     }
 
     pub async fn configure_aps(&self) -> Result<(), PushError> {
@@ -378,14 +417,23 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         
         debug!("Locked");
 
-        let c = current_channels.iter().map(|channel| state.build_aps_message_for(channel, true)).collect::<Vec<_>>();
+        let mut channel_messages = Vec::new();
+        for channel in current_channels.iter() {
+            match state.build_aps_message_for(channel, true) {
+                Ok(msg) => channel_messages.push(msg),
+                Err(e) => {
+                    warn!("Failed to build APS message for channel {:?}: {}", channel, e);
+                    continue;
+                }
+            }
+        }
         drop(state);
         drop(current_channels);
 
-        debug!("Subscribing to channels {c:?}");
+        debug!("Subscribing to channels {channel_messages:?}");
 
-        if !c.is_empty() {
-            self.conn.subscribe_channels(&c, true).await?;
+        if !channel_messages.is_empty() {
+            self.conn.subscribe_channels(&channel_messages, true).await?;
         }
 
         Ok(())
@@ -427,16 +475,17 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
     }
 
     // ratchet upwards
-    pub async fn roll_keys(&self) {
+    pub async fn roll_keys(&self) -> Result<(), PushError> {
         let mut state = self.state.write().await;
         if let Some(key) = &mut state.my_key {
-            key.key = key.key.ratchet();
+            key.key = key.key.ratchet()?;
             (self.update_state)(&state);
         }
+        Ok(())
     }
 
     // reset keys (will need to be resent to all targets)
-    pub async fn reset_keys(&self) {
+    pub async fn reset_keys(&self) -> Result<(), PushError> {
         let mut state = self.state.write().await;
         if let Some(key) = &mut state.my_key {
             let n: [u8; 32] = rand::random();
@@ -444,9 +493,10 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
                 key: n.to_vec(),
                 ratchet: 1,
             };
-            key.signature = CompactECKey::new().unwrap();
+            key.signature = CompactECKey::new()?;
             (self.update_state)(&state);
         }
+        Ok(())
     }
 
     pub async fn ensure_channel(&self) -> Result<(), PushError> {
@@ -475,7 +525,8 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
 
         let key: [u8; 32] = rand::random();
 
-        let channel = response.channel.expect("Got no allocated channel?");
+        let channel = response.channel
+            .ok_or_else(|| PushError::StatusKitEnsureChannelError(0))?;
         let key = StatusKitMyKey {
             channel,
             signature: CompactECKey::new()?,
@@ -498,15 +549,22 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         
         let mut wanted_channels: HashSet<APSChannelIdentifier> = new_channels.keys().cloned().collect();
         debug!("Statuskit wants {} channels", wanted_channels.len());
+        
         let state = self.state.read().await;
-        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
-        // chaneels within lat 24h
-        let mut recents_sorted = state.recent_channels.iter().filter(|c| c.last_assertion_ms >= (now - (60 * 60 * 24 * 1000))).collect::<Vec<_>>();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(PushError::TimeError)?
+            .as_millis() as u64;
+            
+        // channels within last 24h
+        let mut recents_sorted = state.recent_channels.iter()
+            .filter(|c| c.last_assertion_ms >= (now.saturating_sub(CHANNEL_CACHE_DURATION_MS)))
+            .collect::<Vec<_>>();
         recents_sorted.sort_by_key(|r| r.last_assertion_ms);
         recents_sorted.reverse(); // latest assertions first
 
         for channel in recents_sorted {
-            if wanted_channels.len() >= 10 { break };
+            if wanted_channels.len() >= MAX_CHANNELS { break };
             wanted_channels.insert(channel.identifier.clone());
         }
 
@@ -522,6 +580,10 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         debug!("Adding channel {add_channels:?}, removing channels {remove_channels:?}");
 
         let mut state = self.state.write().await;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(PushError::TimeError)?
+            .as_millis() as u64;
         for channel in &add_channels {
             if let Some(existing) = state.recent_channels.iter_mut().find(|c| &&c.identifier == channel) {
                 existing.last_assertion_ms = now;
@@ -534,8 +596,28 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
             }
         }
 
-        let add_channel_req = add_channels.iter().map(|c| state.build_aps_message_for(c, true)).collect::<Vec<_>>();
-        let remove_channel_req = remove_channels.iter().map(|c| state.build_aps_message_for(c, false)).collect::<Vec<_>>();
+        let mut add_channel_req = Vec::new();
+        let mut remove_channel_req = Vec::new();
+        
+        for channel in &add_channels {
+            match state.build_aps_message_for(channel, true) {
+                Ok(msg) => add_channel_req.push(msg),
+                Err(e) => {
+                    warn!("Failed to build APS message for channel {:?}: {}", channel, e);
+                    continue;
+                }
+            }
+        }
+        
+        for channel in &remove_channels {
+            match state.build_aps_message_for(channel, false) {
+                Ok(msg) => remove_channel_req.push(msg),
+                Err(e) => {
+                    warn!("Failed to build APS message for channel {:?}: {}", channel, e);
+                    continue;
+                }
+            }
+        }
 
         (self.update_state)(&state);
 
@@ -552,7 +634,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         }
 
         let mut existing = self.published_channels.write().await;
-        *existing = new_channels.keys().cloned().collect();
+        *existing = wanted_channels;
         
         Ok(())
     }
@@ -563,7 +645,8 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         debug!("Inviting to channel {:?}", handles);
 
         let state = self.state.read().await;
-        let my_key = state.my_key.as_ref().expect("No my key!!");
+        let my_key = state.my_key.as_ref()
+            .ok_or(PushError::StatusKitAuthMissing)?;
         let message = SharedMessage {
             keys: Some(SharedKeys { keys: vec![my_key.key.clone()] }),
             sig_key: my_key.signature.compress().to_vec(),
@@ -571,7 +654,10 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         let my_channel = my_key.channel.channel_id.clone();
         let device = StatusKitRawSharedDevice {
             keys: base64_encode(&message.encode_to_vec()),
-            time_sent_s: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs_f64(),
+            time_sent_s: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(PushError::TimeError)?
+                .as_secs_f64(),
             personal_config: String::new(),
             bundle: "com.apple.focus.status".to_string(),
             channel: base64_encode(&my_channel),
@@ -582,8 +668,13 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
             sender: handle.to_string(),
             raw: Raw::Builder(Box::new(move |handle| {
                 let mut config = device.clone();
-                config.personal_config = base64_encode(&plist_to_bin(&handles[&handle.participant]).unwrap());
-                Some(plist_to_bin(&config).unwrap())
+                match (handles.get(&handle.participant), plist_to_bin(&handles[&handle.participant])) {
+                    (Some(_), Ok(bin)) => {
+                        config.personal_config = base64_encode(&bin);
+                        plist_to_bin(&config).ok()
+                    }
+                    _ => None
+                }
             })),
             send_delivered: false,
             command: 227,
@@ -613,7 +704,8 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         let created = SystemTime::now();
 
         let state = self.state.read().await;
-        let my_key = state.my_key.as_ref().expect("No my key!!");
+        let my_key = state.my_key.as_ref()
+            .ok_or(PushError::StatusKitAuthMissing)?;
         let publish = PublishedStatus {
             message: plist_to_bin(&status)?,
             padding: vec![], // no padding for now
@@ -621,14 +713,15 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
 
         let message = publish.encode_to_vec();
         
-        let key = my_key.key.message_key();
+        let key = my_key.key.message_key()?;
 
-        let cipher = Aes256Gcm::new_from_slice(&key).expect("GCM key creation failed");
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|_| PushError::AESGCMError)?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let first_ciphertext = cipher.encrypt(&nonce, aes_gcm::aead::Payload {
             msg: &message,
             aad: &my_key.signature.compress()
-        }).expect("Failed to decrypt");
+        }).map_err(|_| PushError::AESGCMError)?;
 
         let ciphertext = [
             nonce.to_vec(),
@@ -641,8 +734,14 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         let message = StatusKitInnerMessage {
             ratchet: my_key.key.ratchet,
             id: Uuid::new_v4().to_string().to_uppercase(),
-            date_created: created.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs_f64(),
-            current_server_time: publish_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs_f64(),
+            date_created: created
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(PushError::TimeError)?
+                .as_secs_f64(),
+            current_server_time: publish_time
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(PushError::TimeError)?
+                .as_secs_f64(),
             encrypted_message: base64_encode(&ciphertext),
             signature: base64_encode(&signature),
         };
@@ -656,7 +755,10 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
                 token
             }),
             message: Some(ChannelPublishMessage {
-                time_published: publish_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64,
+                time_published: publish_time
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_err(PushError::TimeError)?
+                    .as_millis() as u64,
                 channel: Some(my_key.channel.clone()),
                 message: serde_json::to_vec(&message)?,
                 valid_for: 1000 * 60 * 60 * 24 * 7, // 7 days
@@ -677,10 +779,21 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
 
     pub async fn request_handles(self: &Arc<Self>, handles: &[String]) -> (ChannelInterestToken<T>, Option<PushError>) {
         let state_lock = self.state.read().await;
-        let topics = state_lock.keys.iter().filter(|(c, d)| handles.contains(&d.from)).map(|(c, _)| APSChannelIdentifier {
-            topic: "com.apple.icloud.presence.mode.status".to_string(),
-            id: base64_decode(&c),
-        }).collect::<Vec<_>>();
+        let topics = state_lock.keys.iter()
+            .filter(|(c, d)| handles.contains(&d.from))
+            .filter_map(|(c, _)| {
+                match base64_decode(c) {
+                    Ok(decoded) => Some(APSChannelIdentifier {
+                        topic: "com.apple.icloud.presence.mode.status".to_string(),
+                        id: decoded,
+                    }),
+                    Err(e) => {
+                        warn!("Failed to decode channel ID {}: {}", c, e);
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
         drop(state_lock);
 
         self.request_channels(topics).await
@@ -712,29 +825,46 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
             let Some(channel) = &channel else { return Ok(None) };
             debug!("Got statuskit message {inner:?} on channel {}", encode_hex(&channel.id));
             let mut state = self.state.write().await;
-            let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { panic!("Channel not found!") };
+            let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { 
+                return Err(PushError::ChannelNotFound(format!("Channel {} not found", encode_hex(&channel.id))));
+            };
 
             let key = referenced_channel.get_key(inner.ratchet)?;
 
             let message = base64_decode(&inner.encrypted_message);
-            referenced_channel.signature.verify(MessageDigest::sha256(), &message, base64_decode(&inner.signature).try_into().expect("Bad signature length!"))?;
+            
+            // Verify signature
+            let signature_bytes = base64_decode(&inner.signature);
+            if signature_bytes.len() != SIGNATURE_SIZE {
+                return Err(PushError::CryptoError("Invalid signature length".to_string()));
+            }
+            let signature_array: [u8; SIGNATURE_SIZE] = signature_bytes.try_into()
+                .map_err(|_| PushError::CryptoError("Failed to convert signature to array".to_string()))?;
+            referenced_channel.signature.verify(MessageDigest::sha256(), &message, signature_array)?;
 
-            let key = key.message_key();
+            let key_bytes = key.message_key()?;
 
-            let cipher = Aes256Gcm::new_from_slice(&key).expect("GCM key creation failed");
+            let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+                .map_err(|_| PushError::AESGCMError)?;
+            
+            if message.len() < MIN_MESSAGE_SIZE {
+                return Err(PushError::CryptoError("Message too short for nonce".to_string()));
+            }
+            
             let plaintext = cipher.decrypt(Nonce::from_slice(&message[..12]), aes_gcm::aead::Payload {
                 msg: &message[12..],
                 aad: &referenced_channel.signature.compress()
-            }).expect("Failed to decrypt");
+            }).map_err(|_| PushError::AESGCMError)?;
 
             let status = PublishedStatus::decode(Cursor::new(&plaintext))?;
             let status: StatusKitStatus = plist::from_bytes(&status.message)?;
 
             let user = referenced_channel.from.clone();
-            let is_available = status.active || status.id.as_ref().map(|s| referenced_channel.personal_config.allowed_modes.contains(s)).unwrap_or(false);
+            let is_available = status.active || status.id.as_ref()
+                .map(|s| referenced_channel.personal_config.allowed_modes.contains(s))
+                .unwrap_or(false);
 
             (self.update_state)(&state); // we might have ratcheted it
-
 
             return Ok(Some(StatusKitMessage::StatusChanged {
                 user,
@@ -752,10 +882,21 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
                     let config: StatusKitPersonalConfig = plist::from_bytes(&base64_decode(&parsed.personal_config))?;
                     let share_message = SharedMessage::decode(Cursor::new(base64_decode(&parsed.keys)))?;
 
+                    // Validate the signature key
+                    if share_message.sig_key.len() != EC_KEY_SIZE {
+                        return Err(PushError::CryptoError("Invalid signature key length".to_string()));
+                    }
+                    let sig_key_array: [u8; EC_KEY_SIZE] = share_message.sig_key.try_into()
+                        .map_err(|_| PushError::CryptoError("Failed to convert signature key to array".to_string()))?;
+                    
+                    let keys = share_message.keys
+                        .ok_or_else(|| PushError::CryptoError("No keys shared in message".to_string()))?
+                        .keys;
+
                     let device = StatusKitSharedDevice {
                         from: sender,
-                        signature: CompactECKey::decompress(share_message.sig_key.try_into().expect("Bad EC Key size?")),
-                        keys: share_message.keys.expect("No keys shared?").keys,
+                        signature: CompactECKey::decompress(sig_key_array),
+                        keys,
                         personal_config: config,
                     };
 
@@ -774,5 +915,3 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         Ok(None)
     }
 }
-
-
