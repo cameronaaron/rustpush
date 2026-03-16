@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -54,10 +55,6 @@ pub mod cloudmessagesp {
 
     include!(concat!(env!("OUT_DIR"), "/cloudmessagesp.rs"));
 
-    impl CloudKitBytesKind for MessageProto {
-        type Kind = ProtoKind;
-    }
-
     impl CloudKitBytesKind for MessageProto3 {
         type Kind = ProtoKind;
     }
@@ -72,6 +69,111 @@ pub mod cloudmessagesp {
 
     impl CloudKitBytesKind for ChatProto {
         type Kind = ProtoKind;
+    }
+}
+
+fn read_varint(bytes: &[u8], start: usize) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    let mut idx = start;
+
+    while idx < bytes.len() && shift < 64 {
+        let byte = bytes[idx];
+        idx += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, idx));
+        }
+        shift += 7;
+    }
+
+    None
+}
+
+fn strip_field_with_wire_type(bytes: &[u8], field_number: u64, wire_type: u64) -> Option<Vec<u8>> {
+    let mut idx = 0usize;
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut changed = false;
+
+    while idx < bytes.len() {
+        let field_start = idx;
+        let (key, mut next_idx) = read_varint(bytes, idx)?;
+        let current_field = key >> 3;
+        let current_wire = key & 0x7;
+
+        match current_wire {
+            0 => {
+                let (_, end_idx) = read_varint(bytes, next_idx)?;
+                next_idx = end_idx;
+            }
+            1 => {
+                next_idx = next_idx.checked_add(8)?;
+                if next_idx > bytes.len() {
+                    return None;
+                }
+            }
+            2 => {
+                let (len, len_end_idx) = read_varint(bytes, next_idx)?;
+                let len = usize::try_from(len).ok()?;
+                next_idx = len_end_idx.checked_add(len)?;
+                if next_idx > bytes.len() {
+                    return None;
+                }
+            }
+            5 => {
+                next_idx = next_idx.checked_add(4)?;
+                if next_idx > bytes.len() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+
+        if current_field == field_number && current_wire == wire_type {
+            changed = true;
+        } else {
+            out.extend_from_slice(&bytes[field_start..next_idx]);
+        }
+
+        idx = next_idx;
+    }
+
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+static MESSAGE_PROTO_RECOVERY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+impl CloudKitBytes for MessageProto {
+    fn from_bytes(v: Vec<u8>) -> Self {
+        match Self::decode(&v[..]) {
+            Ok(msg) => msg,
+            Err(err) => {
+                if let Some(sanitized) = strip_field_with_wire_type(&v, 2, 0) {
+                    if let Ok(msg) = Self::decode(&sanitized[..]) {
+                        let recovery_count = MESSAGE_PROTO_RECOVERY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                        if recovery_count <= 5 || recovery_count % 100 == 0 {
+                            println!(
+                                "Recovered MessageProto decode by stripping field #2 varint payload {} count={}",
+                                encode_hex(&v),
+                                recovery_count
+                            );
+                        }
+                        return msg;
+                    }
+                }
+
+                println!("Failed to decode proto {} {}", encode_hex(&v), err);
+                Self::default()
+            }
+        }
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        self.encode_to_vec()
     }
 }
 
@@ -474,6 +576,7 @@ impl CloudKitBytesKind for AttachmentMeta {
 pub struct CloudAttachment {
     pub cm: GZipWrapper<AttachmentMeta>,
     pub lqa: Asset,
+    pub avid: Asset,
 }
 
 pub struct CloudMessagesClient<P: AnisetteProvider> {
@@ -630,6 +733,15 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         Ok(def)
     }
 
+    pub async fn warm_zone_keys(&self) -> Result<(), PushError> {
+        let container = self.get_container().await?;
+        for zone_name in ["chatManateeZone", "messageManateeZone", "attachmentManateeZone"] {
+            let zone = container.private_zone(zone_name.to_string());
+            container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
+        }
+        Ok(())
+    }
+
     pub async fn reset(&self) -> Result<(), PushError> {
         let container = self.get_container().await?;
 
@@ -703,6 +815,21 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let record: Vec<CloudAttachment> = files.keys().map(|f| records.get_record(f, Some(&key))).collect::<Vec<_>>();
 
         container.get_assets(&records.assets, record.iter().map(|i| &i.lqa).zip(files.into_values()).collect::<Vec<_>>()).await?;
+        Ok(())
+    }
+
+    pub async fn download_attachment_avid<T: Write + Send + Sync>(&self, files: HashMap<String, T>) -> Result<(), PushError> {
+        let container = self.get_container().await?;
+        let zone = container.private_zone("attachmentManateeZone".to_string());
+        let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
+
+        let invoke = container.perform_operations(&CloudKitSession::new(), 
+            &FetchRecordOperation::many(&ALL_ASSETS, &zone, &files.keys().cloned().collect::<Vec<_>>()), IsolationLevel::Operation).await?;
+        let records = FetchedRecords::new(&invoke);
+
+        let record: Vec<CloudAttachment> = files.keys().map(|f| records.get_record(f, Some(&key))).collect::<Vec<_>>();
+
+        container.get_assets(&records.assets, record.iter().map(|i| &i.avid).zip(files.into_values()).collect::<Vec<_>>()).await?;
         Ok(())
     }
 

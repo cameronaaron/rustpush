@@ -1,6 +1,7 @@
 [submodule "apple-private-apis"]
 	path = apple-private-apis
-	url = git@github.com:OpenBubbles/apple-private-apis.git
+	url = https://github.com/cameronaaron/apple-private-apis.git
+	branch = imessage-bridge-compat
 [submodule "open-absinthe"]
 	path = open-absinthe
-	url = git@github.com:OpenBubbles/OpenAbsinthe-Stub.git
+	url = https://github.com/OpenBubbles/OpenAbsinthe-Stub.git

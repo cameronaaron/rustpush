@@ -186,7 +186,7 @@ pub struct IDSDelegateResponse {
     pub profile_id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct MobileMeDelegateResponse {
     pub tokens: HashMap<String, String>,
     #[serde(rename = "com.apple.mobileme")]
