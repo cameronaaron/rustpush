@@ -2313,10 +2313,10 @@ impl<T: Write> StreamTypedCoder<T> {
             self.buffer.write_all(&[num as u8]).unwrap();
         } else if num & 0xffff == num {
             self.buffer.write_all(&[0x81]).unwrap();
-            self.buffer.write_all(&(num as u16).to_le_bytes()).unwrap();;
+            self.buffer.write_all(&(num as u16).to_le_bytes()).unwrap();
         } else {
             self.buffer.write_all(&[0x82]).unwrap();
-            self.buffer.write_all(&num.to_le_bytes()).unwrap();;
+            self.buffer.write_all(&num.to_le_bytes()).unwrap();
         }
     }
 

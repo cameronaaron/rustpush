@@ -1439,7 +1439,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             self.delete(bottle.id()).await?;
         }
 
-        let private = self.new_user_identity().await?;
+        let private = self.new_user_identity(true).await?;
 
         let data = self.config.get_register_meta().os_version;
         let mut item = data.split(",");
@@ -1738,7 +1738,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         })
     }
 
-    pub async fn new_user_identity(&self) -> Result<PrivateUserIdentity, PushError> {
+    pub async fn new_user_identity(&self, reset_state: bool) -> Result<PrivateUserIdentity, PushError> {
         let mut state = self.state.write().await;
 
         let mut anisette_lock = self.anisette.lock().await;
@@ -1748,8 +1748,10 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let (identity, private) = KeychainUserIdentity::new(&machine_id, &self.config.get_register_meta().hardware_version)?;
         
         state.current_bottle = None;
-        state.state = HashMap::new();
-        state.state_token = None;
+        if reset_state {
+            state.state = HashMap::new();
+            state.state_token = None;
+        }
         state.user_identity = Some(identity);
         state.keystore.0.clear();
         state.items.clear();
@@ -1801,7 +1803,10 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             };
             let item = CuttlefishTlkShare::from_record(&share_record.inner.as_ref().unwrap().record_field);
 
-            let Some(sending_peer) = state.state.get(&item.sender) else { continue };
+            let Some(sending_peer) = state.state.get(&item.sender) else {  
+                warn!("missing sender {} in state! {:?}", item.sender, state.state.keys().collect::<Vec<_>>());
+                continue
+            };
             sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(), &base64_decode(&item.signature))?;
 
 
@@ -1900,7 +1905,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     pub async fn join_clique_from_escrow(&self, bottle: &EscrowData, password: &[u8], device_password: &[u8]) -> Result<(), PushError> {
         let other_identity = self.recover_bottle(bottle, password).await?;
 
-        let new_identity = self.new_user_identity().await?;
+        let new_identity = self.new_user_identity(false).await?;
         let state = self.state.read().await;
         let my_identity = state.user_identity.as_ref().unwrap();
 
@@ -1910,6 +1915,11 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         drop(state);
 
         let shares = self.fetch_shares_for(&other_identity).await?;
+        if shares.is_empty() {
+            return Err(PushError::PeerNoShares)            
+        }
+        info!("Joining with {} shared keys.", shares.len());
+
         self.join_clique(device_password, &new_identity, Some(voucher), &shares, vec![]).await?;
         Ok(())
     }

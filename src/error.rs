@@ -35,7 +35,7 @@ pub enum PushError {
     KeyError(KeyError),
     #[error("IDS key missing for {0}")]
     KeyNotFound(String),
-    #[error("Could not deliver message. The recipient does not have iMessage or you are being rate-limited.")]
+    #[error("Could not deliver message. The recipient does not have iMessage or you are being rate-limited. Rate limits can start at 0 users for brand new accounts. The only way to resolve a rate limit is patience, trying to reconfigure or re-install to 'fix' the rate limit will result in being temporarily blocked from iMessage.")]
     NoValidTargets,
     #[error("Failed to connect to APS {0}")]
     APSConnectError(u8),
@@ -48,7 +48,7 @@ pub enum PushError {
     #[cfg(feature = "macos-validation-data")]
     #[error("Absinthe error {0}")]
     AbsintheError(#[from] AbsintheError),
-    #[error("Your iMessage access is temporarily disabled. Try again later, or ask Apple to allow you to use iMessage: https://apple.co/IMFT-mac. Choose 'Get Started,' not 'Chat.' Do not mention you are using OpenBubbles. Apple left a message: {0}")]
+    #[error("Your iMessage access is temporarily disabled. Try again later, or ask Apple to allow you to use iMessage: https://apple.co/IMFT-mac. Choose 'Get Started,' not 'Chat,' and then choose 'Apple Device.' Do not mention you are using OpenBubbles. Apple left a message: {0}")]
     CustomerMessage(SupportAlert),
     #[error("Send timeout; try again")]
     SendTimedOut,
@@ -62,6 +62,8 @@ pub enum PushError {
     MMCSGetFailed(Option<String>),
     #[error("Failed to authenticate. Try logging in to account.apple.com to fix your Apple Account or create a new one: {1:?} {0}")]
     MobileMeError(String, Option<String>),
+    #[error("You need to add a trusted phone number to your Apple Account at account.apple.com. You may be unable to add your phone number. You can also create a new account at account.apple.com. If you get 'Your account cannot be created at this time,' you need to contact Apple Support. For assistance, join our Discord from our website.")]
+    UnauthorizedAccountError,
     #[error("Bad auth cert {0}")]
     AuthInvalid(IDSError),
     #[error("APS parse error {0}")]
@@ -208,4 +210,8 @@ pub enum PushError {
     NoRoutingKey,
     #[error("Removed from Share!")]
     RemovedFromShare,
+    #[error("Failed to accept tos {0}!")]
+    FailedToAcceptTOS(String),
+    #[error("The device you have chosen is invalid! Please choose a different device.")]
+    PeerNoShares,
 }

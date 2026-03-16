@@ -21,6 +21,7 @@ use rand::Rng;
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce, aead::Aead};
 use deku::{DekuContainerWrite, DekuUpdate};
 use x509_cert::{attr::AttributeTypeAndValue, der::{EncodePem, asn1::{BitString, Null, SetOfVec, Utf8StringRef}, pem::LineEnding}, name::{Name, RdnSequence, RelativeDistinguishedName}, request::{CertReq, CertReqInfo}, spki::{AlgorithmIdentifier, ObjectIdentifier, SubjectPublicKeyInfo}};
+use xml::{EventReader, reader::{self, ParserConfig2}};
 
 use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient, PrivateUserIdentity}, util::{DebugMutex, IDS_BAG, KeyPair, KeyPairNew, PhoneNumberResponse, REQWEST, base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip}};
 
@@ -158,14 +159,9 @@ impl<T: AnisetteProvider> TokenProvider<T> {
 
     pub async fn refresh_mme(&self) -> Result<(), PushError> {
         let mut mme = self.mme_delegate.lock().await;
-        let pet = self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
-        let account = self.account.lock().await;
 
-        let Some(spd) = &account.spd else { panic!("No spd!") };
-        let adsid = spd.get("adsid").expect("No adsid!").as_string().unwrap();
-
-        let delegates = login_apple_delegates(account.username.as_ref().unwrap(), &pet, adsid, None, 
-            &mut *account.anisette.lock().await, &*self.os_config, &[LoginDelegate::MobileMe]).await?;
+        self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
+        let delegates = login_apple_delegates(&mut *self.account.lock().await, None, &*self.os_config, &[LoginDelegate::MobileMe]).await?;
 
         *mme = delegates.mobileme;
         *self.mme_refreshed.lock().await = SystemTime::now();
@@ -202,7 +198,158 @@ pub struct DelegateResponses {
     pub mobileme: Option<MobileMeDelegateResponse>,
 }
 
-pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &str, adsid: &str, cookie: Option<&str>, anisette: &mut AnisetteClient<T>, os_config: &dyn OSConfig, delegates: &[LoginDelegate]) -> Result<DelegateResponses, PushError> {
+pub enum UpdateAccountFinish {
+    MacOS,
+    IOS {
+        url: String,
+    }
+}
+
+impl UpdateAccountFinish {
+    pub async fn accept_terms<T: AnisetteProvider>(&self, delegates: &[LoginDelegate], account: &AppleAccount<T>, os_config: &dyn OSConfig) -> Result<DelegateResponses, PushError> {
+        match self {
+            Self::MacOS => {
+                login_apple_delegates(account, Some("termsAccepted=true"), os_config, delegates).await
+            },
+            Self::IOS { url } => {
+                let header_map = build_setup_headers(account, os_config).await?;
+
+                let text = REQWEST.post(url)
+                    .header("Accept", "*/*")
+                    .header("Accept-Encoding", "gzip, deflate, br")
+                    .header("Accept-Language", "en-US,en")
+                    .header("Content-Type", "application/xml")
+                    .headers(header_map)
+                    .send().await?;
+
+                if !text.status().is_success() {
+                    return Err(PushError::FailedToAcceptTOS(text.text().await?))
+                }
+
+                text.bytes().await?;
+
+                login_apple_delegates(account, None, os_config, delegates).await
+            }
+        }
+    }
+}
+
+async fn build_setup_headers<T: AnisetteProvider>(account: &AppleAccount<T>, os_config: &dyn OSConfig) -> Result<HeaderMap, PushError> {
+    let mut map = HashMap::new();
+    let base_headers = account.anisette.lock().await.get_headers().await?.clone();
+    map.extend(base_headers);
+
+    map.extend([
+        ("Authorization", format!("Basic {}", base64::encode(format!("{}:{}", account.username.as_ref().unwrap().trim(), account.get_pet().expect("No pet b?"))))),
+        ("User-Agent", format!("iOS iPhone {} iPhone Setup Assistant", os_config.get_register_meta().software_version)),
+        ("Cookie", "repairSteps=".to_string()),
+        ("X-MMe-Country", "US".to_string()),
+        ("X-MMe-Language", "en,en-US".to_string()),
+        ("X-MMe-Client-Info", os_config.get_mme_clientinfo("com.apple.AppleAccount/1.0 (com.apple.Preferences/1112.96)")),
+    ].into_iter().map(|(a, b)| (a.to_string(), b)));
+
+    Ok(HeaderMap::from_iter(map.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap()))))
+}
+
+pub async fn request_update_account<T: AnisetteProvider>(account: &AppleAccount<T>, os_config: &dyn OSConfig) -> Result<(String, UpdateAccountFinish), PushError> {
+    let data = os_config.get_version_ua();
+    if data.contains("macOS") {
+        let result = account.request_update_account().await?;
+        Ok((result, UpdateAccountFinish::MacOS))
+    } else {
+        let header_map = build_setup_headers(account, os_config).await?;
+
+        #[derive(Serialize)]
+        struct RequestedTerms {
+            name: &'static str,
+        }
+
+        #[derive(Serialize)]
+        struct TermsUIRequest {
+            format: &'static str,
+            terms: Vec<RequestedTerms>,
+        }
+
+        let buffer = plist_to_string(&TermsUIRequest {
+            format: "plist/buddyml",
+            terms: vec![RequestedTerms {
+                name: "iCloud",
+            }]
+        })?;
+
+        let text = REQWEST.post("https://setup.icloud.com/setup/iosbuddy/ui/genericTermsUI")
+            .header("Accept", "application/x-buddyml")
+            .header("Accept-Encoding", "gzip, deflate, br")
+            .header("Accept-Language", "en-US,en")
+            .header("Content-Type", "text/plist")
+            .header("X-Apple-I-Appearance", "1")
+            .headers(header_map)
+            .body(buffer)
+            .send().await?
+            .bytes().await?;
+
+        let reader: EventReader<Cursor<_>> = EventReader::new_with_config(Cursor::new(&text), 
+            ParserConfig2::new().cdata_to_characters(true));
+        let mut agree_url: Option<String> = None;
+        let mut current_page: Option<String> = None;
+        let mut current_page_html: Option<String> = None;
+
+        let mut pages: HashMap<String, String> = HashMap::new();
+        
+        for e in reader {
+            match e {
+                Ok(reader::XmlEvent::StartElement { name, attributes, namespace: _ }) => {
+                    let get_attr = |name: &str, def: Option<&str>| {
+                        attributes.iter().find(|attr| attr.name.to_string() == name)
+                            .map_or_else(|| def.expect(&format!("attribute {} doesn't exist!", name)).to_string(), |data| data.value.to_string())
+                    };
+                    match name.local_name.as_str() {
+                        "clientInfo" => {
+                            agree_url = Some(get_attr("agreeUrl", None));
+                        },
+                        "page" => {
+                            current_page = Some(get_attr("id", Some("default")))
+                        },
+                        "html" => {
+                            current_page_html = current_page.clone();
+                        },
+                        _ => {}
+                    }
+                },
+                Ok(reader::XmlEvent::EndElement { name }) => {
+                    match name.local_name.as_str() {
+                        "page" => {
+                            current_page = None;
+                        },
+                        "html" => {
+                            current_page_html = None;
+                        },
+                        _ => {}
+                    }
+                },
+                Ok(reader::XmlEvent::Characters(data)) => {
+                    if let Some(page) = &current_page_html {
+                        pages.entry(page.clone()).or_default().push_str(&data);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok((pages.remove("iCloud").unwrap_or_default(), UpdateAccountFinish::IOS { url: agree_url.expect("No agree url???") }))
+    }
+}
+
+
+pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T>, cookie: Option<&str>, os_config: &dyn OSConfig, delegates: &[LoginDelegate]) -> Result<DelegateResponses, PushError> {
+    let Some(pet) = account.get_pet() else { panic!("No pet!") };
+    let Some(spd) = &account.spd else { panic!("No spd!") };
+
+    debug!("Got spd {:?}", spd);
+    let adsid = spd.get("adsid").expect("No adsid!").as_string().unwrap();
+
+    let username = account.username.as_ref().unwrap();
+    
     let request = AuthRequest {
         apple_id: username.to_string(),
         client_id: Uuid::new_v4().to_string(),
@@ -212,7 +359,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
 
     let validation_data = os_config.generate_validation_data().await?;
 
-    let base_headers = anisette.get_headers().await?;
+    let base_headers = account.anisette.lock().await.get_headers().await?.clone();
     let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
 
     if let Some(cookie) = cookie {
@@ -237,6 +384,9 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
 
     if let Some(error) = parsed_dict.get("localizedError") {
         let error = error.as_string().unwrap();
+        if error == "UNAUTHORIZED" {
+            return Err(PushError::UnauthorizedAccountError);
+        }
         return Err(PushError::MobileMeError(error.to_string(), parsed_dict.get("description").and_then(|d| d.as_string().map(|s| s.to_string()))));
     }
 
@@ -979,7 +1129,9 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
     }
 
     pub async fn setup_trusted_peers(&mut self, peers: Arc<KeychainClient<P>>, device_password: &[u8]) -> Result<(), PushError> {
-        self.private_identity = Some(peers.new_user_identity().await?);
+        self.private_identity = Some(peers.new_user_identity(false).await?);
+
+        peers.sync_trust().await?;
 
         let Some(request) = &self.saved_step else { return Ok(()) };
         if request.step != 4 {
