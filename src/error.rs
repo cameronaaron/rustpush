@@ -37,7 +37,7 @@ pub enum PushError {
     KeyNotFound(String),
     #[error("Could not deliver message. The recipient does not have iMessage or you are being rate-limited. Rate limits can start at 0 users for brand new accounts. The only way to resolve a rate limit is patience, trying to reconfigure or re-install to 'fix' the rate limit will result in being temporarily blocked from iMessage.")]
     NoValidTargets,
-    #[error("Failed to connect to APS {0}")]
+    #[error("Aps connection failed. You need to re-setup your device. Go to Settings -> Change Apple Hardware. For self-hosted users, have your hardware code ready. ({0})")]
     APSConnectError(u8),
     #[error("TLS error {0}")]
     TLSError(#[from] rustls::Error),
@@ -62,7 +62,7 @@ pub enum PushError {
     MMCSGetFailed(Option<String>),
     #[error("Failed to authenticate. Try logging in to account.apple.com to fix your Apple Account or create a new one: {1:?} {0}")]
     MobileMeError(String, Option<String>),
-    #[error("You need to add a trusted phone number to your Apple Account at account.apple.com. You may be unable to add your phone number. You can also create a new account at account.apple.com. If you get 'Your account cannot be created at this time,' you need to contact Apple Support. For assistance, join our Discord from our website.")]
+    #[error("You need to add a trusted phone number to your Apple Account at account.apple.com. You may be unable to add your phone number. You can also create a new account at account.apple.com. If you get 'Your account cannot be created at this time,' you need to contact Apple Support. Do not mention OpenBubbles. For assistance, join our Discord from our website.")]
     UnauthorizedAccountError,
     #[error("Bad auth cert {0}")]
     AuthInvalid(IDSError),

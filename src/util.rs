@@ -242,6 +242,7 @@ pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
 });
 
 pub static CARRIER_REQWEST: LazyLock<Client> = LazyLock::new(|| {
+    // return build_proxy();
     let mut headers = HeaderMap::new();
     headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
 
@@ -1066,6 +1067,11 @@ impl<T: Resource + 'static> ResourceManager<T> {
     pub async fn ensure_ready(&self) -> Result<(), PushError> {
         // wait for any generation to finish
         self.resource_state.subscribe().wait_for(|i| !matches!(i, ResourceState::Generating)).await.map_err(|_| PushError::ResourceClosed)?;
+        self.ensure_not_failed()
+    }
+
+    pub fn ensure_not_failed(&self) -> Result<(), PushError> {
+        info!("Ensuring not failed");
         match &*self.resource_state.borrow() {
             ResourceState::Failed(error) => Err(error.clone().into()),
             ResourceState::Closed => Err(PushError::ResourceClosed),

@@ -646,6 +646,13 @@ impl APSConnectionResource {
     }
 
     pub async fn send(&self, message: APSMessage) -> Result<(), PushError> {
+        info!("Attempting to send");
+        // during init can be none
+        let manager_lock = self.manager.lock().await;
+        if let Some(manager_lock) = &*manager_lock {
+            manager_lock.upgrade().unwrap().ensure_not_failed()?;
+        }
+        drop(manager_lock);
         let mut raw = message.to_raw();
         for message in &mut raw.body {
             message.update()?;
