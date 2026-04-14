@@ -333,8 +333,9 @@ impl IMClient {
         };
         drop(ident_cache);
 
-        // if we have multiple people, but not a single target going to not us, we cannot "send" this message.
-        if targets.len() > 1 && !message_targets.iter().any(|target| !handles.contains(&target.participant)) {
+        // if we have other people, but not a single target going to not us, we cannot "send" this message.
+        if targets.iter().any(|target| !handles.contains(target)) && 
+            !message_targets.iter().any(|target| !handles.contains(&target.participant)) {
             return Err(PushError::NoValidTargets);
         }
         

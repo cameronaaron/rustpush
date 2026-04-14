@@ -151,7 +151,7 @@ impl OSConfig for MacOSConfig {
     }
 
     fn get_login_url(&self) -> &'static str {
-        "https://setup.icloud.com/setup/prefpane/loginDelegates"
+        "https://setup.icloud.com/setup/signin/v2/login"
     }
 
     fn get_private_data(&self) -> Dictionary {

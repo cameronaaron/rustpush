@@ -34,6 +34,22 @@ struct AuthRequest {
     password: String
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct V2AuthRequest {
+    delegates: Value,
+    protocol_version: String,
+    user_info: V2AuthUserInfo,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct V2AuthUserInfo {
+    client_id: String,
+    language: String,
+    timezone: String,
+}
+
 #[derive(Clone, Copy)]
 pub enum LoginDelegate {
     IDS,
@@ -189,7 +205,7 @@ pub struct IDSDelegateResponse {
 #[derive(Deserialize)]
 pub struct MobileMeDelegateResponse {
     pub tokens: HashMap<String, String>,
-    #[serde(rename = "com.apple.mobileme")]
+    #[serde(default)]
     pub config: Dictionary,
 }
 
@@ -350,11 +366,21 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
 
     let username = account.username.as_ref().unwrap();
     
-    let request = AuthRequest {
-        apple_id: username.to_string(),
-        client_id: Uuid::new_v4().to_string(),
+    // let request = AuthRequest {
+    //     apple_id: username.to_string(),
+    //     client_id: Uuid::new_v4().to_string(),
+    //     delegates: Value::Dictionary(Dictionary::from_iter(delegates.iter().map(|d| d.delegate()))),
+    //     password: pet.to_string()
+    // };
+
+    let request = V2AuthRequest {
         delegates: Value::Dictionary(Dictionary::from_iter(delegates.iter().map(|d| d.delegate()))),
-        password: pet.to_string()
+        protocol_version: "1.0".to_string(),
+        user_info: V2AuthUserInfo {
+            client_id: Uuid::new_v4().to_string().to_uppercase(),
+            language: "en-US".to_string(),
+            timezone: "America/New_York".to_string(),
+        }
     };
 
     let validation_data = os_config.generate_validation_data().await?;
@@ -414,9 +440,15 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
 
     let delegates = parsed_dict.get("delegates").unwrap().as_dictionary().unwrap();
 
+    let mut mme: Option<MobileMeDelegateResponse> = get_delegate(delegates, "com.apple.mobileme")?;
+
+    if let Some(mme) = &mut mme {
+        mme.config = get_delegate(delegates, "com.apple.mobileme")?.expect("No MME??");
+    }
+
     Ok(DelegateResponses {
         ids: get_delegate(delegates, "com.apple.private.ids")?,
-        mobileme: get_delegate(delegates, "com.apple.mobileme")?,
+        mobileme: mme,
     })
 }
 

@@ -125,7 +125,7 @@ impl OSConfig for RelayConfig {
     }
 
     fn get_login_url(&self) -> &'static str {
-        "https://setup.icloud.com/setup/prefpane/loginDelegates"
+        "https://setup.icloud.com/setup/signin/v2/login"
     }
 
     fn get_activation_device(&self) -> String {
