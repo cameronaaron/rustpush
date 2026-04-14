@@ -18,8 +18,8 @@ openssl = { version = "0.10.56", features = ["vendored"] }
 uuid = { version = "1.4.1", features = ["v4"] }
 base64 = "0.21.2"
 regex = "1.9.3"
-tokio-rustls = "0.24.1"
-rustls = "0.21.6"
+tokio-rustls = "0.26.4"
+rustls = "0.23.38"
 rustls-pemfile = "1.0.3"
 rand = { version = "0.8.5", features = ["min_const_gen"] }
 libflate = "2.0.0"

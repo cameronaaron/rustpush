@@ -771,7 +771,7 @@ impl<S: RequestState> SignedRequest<S> {
         debug!("sending apns query {:?}", request);
 
         let receiver = aps.subscribe().await;
-        aps.send_message(topic, plist_to_bin(&request)?, None).await?;
+        aps.send_message(topic, request, None).await?;
 
         let response = aps.wait_for_timeout(receiver, get_message(|payload| {
             let Some(recv_id) = payload.as_dictionary().unwrap().get("U") else {
@@ -1397,7 +1397,7 @@ impl IdmsAuthListener {
     }
 
     pub fn handle(&self, message: APSMessage) -> Result<Option<IdmsMessage>, PushError> {
-        let APSMessage::Notification { topic, payload, .. } = message else { return Ok(None) };
+        let APSMessage::Notification { topic, payload: Value::Data(payload), .. } = message else { return Ok(None) };
         if &topic != &sha1("com.apple.idmsauth".as_bytes()) { return Ok(None) }
 
         let data: serde_json::value::Map<String, serde_json::Value> = serde_json::from_slice(&payload)?;

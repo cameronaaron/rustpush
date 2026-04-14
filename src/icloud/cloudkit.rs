@@ -625,7 +625,7 @@ pub struct CloudKitNotifWatcher {
 
 impl CloudKitNotifWatcher {
     pub async fn handle(&self, msg: &APSMessage) -> Result<Vec<RecordZoneIdentifier>, PushError> {
-        let APSMessage::Notification { topic, payload, .. } = &msg else { return Ok(vec![]) };
+        let APSMessage::Notification { topic, payload: Value::Data(payload), .. } = &msg else { return Ok(vec![]) };
         if topic != &self.for_topic { return Ok(vec![]) }
         
         let data = std::str::from_utf8(payload).expect("Failed to decode?");

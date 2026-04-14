@@ -15,7 +15,7 @@ use rand::RngCore;
 use uuid::Uuid;
 use std::str::FromStr;
 use std::fmt::Debug;
-use crate::util::{DebugMutex, DebugRwLock};
+use crate::{aps::new_aps_id, util::{DebugMutex, DebugRwLock}};
 
 use crate::{APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError, aps::{APSConnection, APSInterestToken, get_message}, ids::{MessageBody, user::{IDSError, IDSLookupUser}}, register, util::{Resource, ResourceManager, base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip}};
 
@@ -718,7 +718,7 @@ impl IdentityResource {
     }
 
     pub async fn handle(&self, msg: APSMessage) -> Result<bool, PushError> {
-        let APSMessage::Notification { id: _, topic, token: _, payload, channel: _ } = msg else { return Ok(false) };
+        let APSMessage::Notification { id: _, topic, token: _, payload: Value::Data(payload), channel: _ } = msg else { return Ok(false) };
         if topic != sha1("com.apple.private.ids".as_bytes()) { return Ok(false) };
 
         #[derive(Deserialize)]
@@ -766,9 +766,9 @@ impl IdentityResource {
     pub async fn receive_message(&self, msg: APSMessage, topics: &[&'static str]) -> Result<Option<IDSRecvMessage>, PushError> {
         let APSMessage::Notification { id: _, topic, token: _, payload, channel: _ } = msg else { return Ok(None) };
         let Some(topic) = topics.iter().find(|t| sha1(t.as_bytes()) == topic) else { return Ok(None) };
-        debug!("ID got message {topic} {:?}", plist::from_bytes::<Value>(&payload)?);
+        debug!("ID got message {topic} {:?}", &payload);
 
-        let mut payload = plist::from_bytes::<IDSRecvMessage>(&payload)?;
+        let mut payload = plist::from_value::<IDSRecvMessage>(&payload)?;
 
 
         payload.topic = *topic;
@@ -882,7 +882,7 @@ impl IdentityResource {
 
     pub async fn certify_delivery(&self, topic: &'static str, delivery: &CertifiedContext, notify: bool) -> Result<(), PushError> {
         debug!("Certifying delivery for message {} notify {notify}", Uuid::from_bytes(delivery.uuid.clone().try_into().expect("Bad message uuid size!")).to_string());
-        let msg_id = rand::thread_rng().next_u32();
+        let msg_id = new_aps_id();
         let mut dict = Dictionary::from_iter([
             // sends APN ack
             ("cdr", Value::Data(delivery.receipt.clone())),
@@ -902,7 +902,7 @@ impl IdentityResource {
                 ("gd".to_string(), Value::Boolean(true)),
             ]);
         }
-        self.aps.send_message(topic, plist_to_bin(&dict)?, Some(msg_id)).await?;
+        self.aps.send_message(topic, dict, Some(msg_id)).await?;
 
         Ok(())
     }
@@ -1014,7 +1014,7 @@ pub struct SendMessage {
     pub user_agent: String,
     pub v: Option<u32>,
     #[serde(rename = "i")]
-    pub message_id: u32,
+    pub message_id: i32,
     #[serde(rename = "U")]
     pub uuid: Data,
     #[serde(rename = "dtl")]
@@ -1107,7 +1107,7 @@ impl InnerSendJob {
 
         let mut messages = self.conn.subscribe().await;
 
-        let msg_id = rand::thread_rng().next_u32();
+        let msg_id = new_aps_id();
         let uuid = Uuid::from_str(&message.id).unwrap().as_bytes().to_vec();
         let is_relay_message = message.relay.is_some();
         let apns_topic = if is_relay_message {
@@ -1147,8 +1147,7 @@ impl InnerSendJob {
 
             debug!("Sending value {value:?}");
 
-            let binary = plist_to_bin(&value)?;
-            self.conn.send_message(apns_topic, binary, Some(msg_id)).await?
+            self.conn.send_message(apns_topic, value, Some(msg_id)).await?
         }
 
         if !message.no_response {

@@ -14,7 +14,7 @@ use async_recursion::async_recursion;
 use std::io::Seek;
 use rand::RngCore;
 
-use crate::{aps::get_message, ids::{identity_manager::{IDSSendMessage, MessageTarget, Raw}, CertifiedContext, IDSRecvMessage}, mmcs::{self, put_authorize_body, AuthorizedOperation, MMCSReceipt, ReadContainer, WriteContainer}, util::{base64_decode, base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}, OSConfig};
+use crate::{OSConfig, aps::{get_message, new_aps_id}, ids::{CertifiedContext, IDSRecvMessage, identity_manager::{IDSSendMessage, MessageTarget, Raw}}, mmcs::{self, AuthorizedOperation, MMCSReceipt, ReadContainer, WriteContainer, put_authorize_body}, util::{KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass, base64_decode, base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string}};
 
 use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, MMCSConfig, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
@@ -1161,7 +1161,7 @@ struct RequestMMCSUpload {
     v: u64,
     ua: String,
     c: u64,
-    i: u32,
+    i: i32,
     #[serde(rename = "cV")]
     cv: u32,
     #[serde(rename = "cH")]
@@ -1249,7 +1249,7 @@ impl MMCSFile {
         let mut inputs = vec![(&prepared.mmcs, None, send_container)];
         let (headers, body) = put_authorize_body(&mmcs_config, &inputs);
 
-        let msg_id = rand::thread_rng().next_u32();
+        let msg_id = new_aps_id();
         let complete = RequestMMCSUpload {
             c: 150,
             ua: mmcs_config.mini_ua.clone(),
@@ -1261,9 +1261,8 @@ impl MMCSFile {
             headers: format!("{}\n", headers.into_iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("\n")),
             body: body.into()
         };
-        let binary = plist_to_bin(&complete)?;
         let recv = apns.subscribe().await;
-        apns.send_message("com.apple.madrid", binary, Some(msg_id)).await?;
+        apns.send_message("com.apple.madrid", complete, Some(msg_id)).await?;
 
         let reader = apns.wait_for_timeout(recv, get_message(|loaded| {
             let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
@@ -1272,7 +1271,7 @@ impl MMCSFile {
             let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
                 return None
             };
-            if c.as_unsigned_integer().unwrap() == 150 && i.as_unsigned_integer().unwrap() as u32 == msg_id {
+            if c.as_unsigned_integer().unwrap() == 150 && i.as_signed_integer().unwrap() as i32 == msg_id {
                 Some(loaded)
             } else { None }
         }, &["com.apple.madrid"])).await?;
@@ -1311,7 +1310,7 @@ impl MMCSFile {
             v: u64,
             ua: String,
             c: u64,
-            i: u32,
+            i: i32,
             #[serde(rename = "cH")]
             headers: String,
             #[serde(rename = "mR")]
@@ -1341,7 +1340,7 @@ impl MMCSFile {
         let recieve_container = IMessageContainer::new(&self.key, writer, true);
 
         let domain = self.url.replace(&format!("/{}", &self.object), "");
-        let msg_id = rand::thread_rng().next_u32();
+        let msg_id = new_aps_id();
         let header = format!("x-mme-client-info:{}", mmcs_config.mme_client_info);
         let request_download = RequestMMCSDownload {
             object: self.object.to_string(),
@@ -1363,9 +1362,8 @@ impl MMCSFile {
 
         info!("mmcs obj {} sig {}", self.object, encode_hex(&self.signature));
         
-        let binary = plist_to_bin(&request_download)?;
         let recv = apns.subscribe().await;
-        apns.send_message("com.apple.madrid", binary, Some(msg_id)).await?;
+        apns.send_message("com.apple.madrid", request_download, Some(msg_id)).await?;
 
         let reader = apns.wait_for_timeout(recv, get_message(|loaded| {
             let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
@@ -1374,7 +1372,7 @@ impl MMCSFile {
             let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
                 return None
             };
-            if c.as_unsigned_integer().unwrap() == 151 && i.as_unsigned_integer().unwrap() as u32 == msg_id {
+            if c.as_unsigned_integer().unwrap() == 151 && i.as_signed_integer().unwrap() as i32 == msg_id {
                 Some(loaded)
             } else { None }
         }, &["com.apple.madrid"])).await?;

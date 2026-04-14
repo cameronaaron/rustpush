@@ -2598,3 +2598,45 @@ impl Into<String> for NSURL {
 }
 
 
+
+use std::io;
+
+pub trait BinaryReadExt: Read {
+    fn read_u8_exact(&mut self) -> io::Result<u8> {
+        let mut buf = [0u8; 1];
+        self.read_exact(&mut buf)?;
+        Ok(buf[0])
+    }
+
+    fn read_u16_le(&mut self) -> io::Result<u16> {
+        let mut buf = [0u8; 2];
+        self.read_exact(&mut buf)?;
+        Ok(u16::from_le_bytes(buf))
+    }
+
+    fn read_u16_be(&mut self) -> io::Result<u16> {
+        let mut buf = [0u8; 2];
+        self.read_exact(&mut buf)?;
+        Ok(u16::from_be_bytes(buf))
+    }
+
+    fn read_u32_le(&mut self) -> io::Result<u32> {
+        let mut buf = [0u8; 4];
+        self.read_exact(&mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    fn read_u32_be(&mut self) -> io::Result<u32> {
+        let mut buf = [0u8; 4];
+        self.read_exact(&mut buf)?;
+        Ok(u32::from_be_bytes(buf))
+    }
+
+    fn read_n(&mut self, n: usize) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        self.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+impl<R: Read + ?Sized> BinaryReadExt for R {}

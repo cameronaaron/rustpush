@@ -16,7 +16,7 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 use rand::{rngs::OsRng, RngCore};
 
-use crate::{APSConnection, APSMessage, IdentityManager, OSConfig, PushError, TokenProvider, aps::{APSChannel, APSChannelIdentifier, APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSSendMessage, Raw}, user::QueryOptions}, util::{DebugMutex, DebugRwLock, base64_decode, base64_encode, decode_hex, encode_hex, plist_to_bin}};
+use crate::{APSConnection, APSMessage, IdentityManager, OSConfig, PushError, TokenProvider, aps::{APSChannel, APSChannelIdentifier, APSInterestToken, get_message, new_aps_id}, ids::{IDSRecvMessage, identity_manager::{IDSSendMessage, Raw}, user::QueryOptions}, util::{DebugMutex, DebugRwLock, base64_decode, base64_encode, decode_hex, encode_hex, plist_to_bin}};
 use crate::util::{CompactECKey, ec_serialize, ec_serialize_priv, bin_serialize, bin_deserialize, proto_serialize, proto_deserialize, ec_deserialize_priv_compact, ec_deserialize_compact, proto_serialize_vec, proto_deserialize_vec};
 use aes_gcm::KeyInit;
 
@@ -197,7 +197,7 @@ pub struct ManageRequest {
     #[serde(rename = "v")]
     version: u32,
     #[serde(rename = "i")]
-    id: u32,
+    id: i32,
     #[serde(rename = "U")]
     uuid: Data,
 }
@@ -419,7 +419,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
 
     pub async fn send_manage_request<ReqMsg: Message, ResMsg: Message + Default>(&self, request: ReqMsg, command: u8) -> Result<ResMsg, PushError> {
         debug!("Sending channel manage request {command}, {request:?}");
-        let msg_id = rand::thread_rng().next_u32();
+        let msg_id = new_aps_id();
         let req = ManageRequest {
             request: request.encode_to_vec().into(),
             command,
@@ -431,14 +431,14 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         };
 
         let recv = self.conn.subscribe().await;
-        self.conn.send_message("com.apple.icloud.presence.channel.management", plist_to_bin(&req)?, Some(msg_id)).await?;
+        self.conn.send_message("com.apple.icloud.presence.channel.management", req, Some(msg_id)).await?;
 
         Ok(ResMsg::decode(Cursor::new(self.conn.wait_for_timeout(recv, get_message(|loaded| {
             debug!("Got message {:?}", loaded);
             #[derive(Deserialize)]
             struct Res {
                 c: u8,
-                i: u32,
+                i: i32,
                 #[serde(rename = "scRes")]
                 sc_res: Data,
             }
@@ -716,7 +716,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
     }
 
     pub async fn handle(&self, msg: APSMessage) -> Result<Option<StatusKitMessage>, PushError> {
-        let APSMessage::Notification { id: _, topic, token: _, payload, channel } = msg.clone() else { return Ok(None) };
+        let APSMessage::Notification { id: _, topic, token: _, payload: Value::Data(payload), channel } = msg.clone() else { return Ok(None) };
         if let Some(channel) = &channel {
             let mut state = self.state.write().await;
             if let Some(local_channel) = state.recent_channels.iter_mut().find(|c| c.identifier.id == channel.id && sha1(c.identifier.topic.as_bytes()) == topic) {

@@ -181,7 +181,7 @@ impl IMClient {
                 e: duration_since_epoch().as_nanos() as u64,
             };
 
-            conn.send_message("com.apple.madrid", plist_to_bin(&msg).unwrap(), None).await?;
+            conn.send_message("com.apple.madrid", msg, None).await?;
         }
         Ok(())
     }
