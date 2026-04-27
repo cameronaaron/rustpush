@@ -404,7 +404,7 @@ async fn main() {
         let pet = account.get_pet().unwrap();
         let spd = account.spd.as_ref().unwrap();
 
-        let delegates = login_apple_delegates(&gsa.user, &pet, spd["adsid"].as_string().unwrap(), None, &mut *anisette_client.lock().await, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
+        let delegates = login_apple_delegates(&account, None, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
         let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref()).await.unwrap();
 
         let mobileme = delegates.mobileme.unwrap();
@@ -605,10 +605,10 @@ async fn main() {
     token_provider.clone(), anisette_client.clone(), client.identity.clone()).await.unwrap();
 
     let state: PasswordState = plist::from_file("passwords.plist").unwrap_or_default();
-    let passwords = PasswordManager::new(
-        keychain.clone(), cloudkit.clone(), client.identity.clone(), connection.clone(), state, Box::new(move |state| {
-            plist::to_file_xml("passwords.plist", state).unwrap();
-        })).await;
+    // let passwords = PasswordManager::new(
+    //     keychain.clone(), cloudkit.clone(), client.identity.clone(), connection.clone(), state, Box::new(move |state| {
+    //         plist::to_file_xml("passwords.plist", state).unwrap();
+    //     })).await;
 
 
     if let Some(mut s) = session {
@@ -933,9 +933,9 @@ async fn main() {
         tokio::select! {
             msg = subscription.recv() => {
                 let msg = msg.unwrap();
-                if let Err(e) = passwords.handle(msg.clone()).await {
-                    info!("err {e}");
-                }
+                // if let Err(e) = passwords.handle(msg.clone()).await {
+                //     info!("err {e}");
+                // }
                 // if let Err(e) = findmy_client.handle(msg.clone()).await {
                 //     info!("err {e}");
                 // }
